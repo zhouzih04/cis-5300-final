@@ -633,7 +633,7 @@ if __name__ == "__main__":
         f"{args.output}/xgboost_test.csv"
     )
     
-    print("\n✅ All datasets prepared successfully!")
+    print("\nAll datasets prepared successfully!")
     print(f"\nNext steps:")
     print(f"  1. Train XGBoost on: {args.output}/xgboost_train.csv")
     print(f"  2. Use constraints from: {args.output}/clustering_constraints.json")
