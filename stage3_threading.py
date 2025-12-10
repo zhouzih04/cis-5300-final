@@ -1,14 +1,5 @@
 """
 Stage 3: Event Threading for Temporal Ordering
-
-This stage takes clustered articles from Stage 2 and determines
-the temporal/narrative ordering within each cluster.
-
-Key features:
-1. Classifies relationship between article pairs (SAME_DAY, UPDATE, DEVELOPMENT, etc.)
-2. Builds a directed graph of article relationships
-3. Extracts timeline ordering using topological sort
-4. Identifies key events vs. follow-up coverage
 """
 
 import pandas as pd
@@ -19,6 +10,7 @@ from datetime import datetime
 from collections import defaultdict
 import json
 import pickle
+import re
 from itertools import combinations
 
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -34,10 +26,6 @@ except ImportError:
     NETWORKX_AVAILABLE = False
 
 
-# =============================================================================
-# TEMPORAL RELATIONSHIP TYPES
-# =============================================================================
-
 TEMPORAL_RELATIONS = {
     'SAME_DAY': 0,           # Same day coverage of same event
     'IMMEDIATE_UPDATE': 1,    # 1-2 days: Direct follow-up
@@ -47,46 +35,43 @@ TEMPORAL_RELATIONS = {
 }
 
 
-# =============================================================================
-# FEATURE ENGINEERING FOR THREADING
-# =============================================================================
+def extract_numbers(text: str) -> set:
+    """Extract all numbers from text."""
+    return set(re.findall(r'\b\d+\b', str(text)))
 
-def extract_threading_features(
+
+def extract_capitalized_words(text: str) -> set:
+    """Extract capitalized words."""
+    if pd.isna(text):
+        return set()
+    words = re.findall(r'\b[A-Z][a-z]+\b', str(text))
+    return set(w.lower() for w in words)
+
+
+def get_bigrams(text: str) -> set:
+    """Extract word bigrams."""
+    words = text.lower().split()
+    if len(words) < 2:
+        return set()
+    return set(zip(words[:-1], words[1:]))
+
+
+def extract_threading_features_fixed(
     title_a: str,
     title_b: str,
-    date_a: str,
-    date_b: str,
     tfidf_vectorizer: TfidfVectorizer = None
 ) -> Dict[str, float]:
-    """
-    Extract features for predicting temporal relationship.
-    
-    Features:
-    - Temporal: days apart, which is earlier
-    - Lexical: word overlap, shared entities, novelty
-    - Semantic: TF-IDF cosine similarity
-    - Linguistic: backward reference indicators
-    """
+    """Extract threading features."""
     features = {}
     
-    # Parse dates
-    d_a = datetime.strptime(date_a, '%Y-%m-%d') if isinstance(date_a, str) else date_a
-    d_b = datetime.strptime(date_b, '%Y-%m-%d') if isinstance(date_b, str) else date_b
-    
-    # Temporal features
-    days_apart = abs((d_b - d_a).days)
-    features['days_apart'] = days_apart
-    features['log_days_apart'] = np.log1p(days_apart)
-    features['a_is_earlier'] = 1 if d_a <= d_b else 0
-    
-    # Preprocess text
-    text_a = str(title_a).lower().strip()
-    text_b = str(title_b).lower().strip()
+    text_a = str(title_a).lower().strip() if not pd.isna(title_a) else ""
+    text_b = str(title_b).lower().strip() if not pd.isna(title_b) else ""
+    orig_a = str(title_a) if not pd.isna(title_a) else ""
+    orig_b = str(title_b) if not pd.isna(title_b) else ""
     
     words_a = set(text_a.split())
     words_b = set(text_b.split())
     
-    # Lexical overlap features
     intersection = len(words_a & words_b)
     union = len(words_a | words_b)
     
@@ -94,41 +79,48 @@ def extract_threading_features(
     features['common_words'] = intersection
     features['words_only_in_a'] = len(words_a - words_b)
     features['words_only_in_b'] = len(words_b - words_a)
-    
-    # Novelty: how much new content in B?
     features['novelty_ratio'] = len(words_b - words_a) / len(words_b) if len(words_b) > 0 else 0
     
-    # Length features
     features['len_a'] = len(words_a)
     features['len_b'] = len(words_b)
     features['len_diff'] = abs(len(words_a) - len(words_b))
     features['len_ratio'] = min(len(words_a), len(words_b)) / max(len(words_a), len(words_b)) if max(len(words_a), len(words_b)) > 0 else 0
     
-    # Character length
-    features['char_len_a'] = len(text_a)
-    features['char_len_b'] = len(text_b)
+    entities_a = extract_capitalized_words(orig_a)
+    entities_b = extract_capitalized_words(orig_b)
+    entity_intersection = len(entities_a & entities_b)
+    entity_union = len(entities_a | entities_b)
+    features['entity_overlap'] = entity_intersection / entity_union if entity_union > 0 else 0
     
-    # Backward reference indicators (B references A)
-    backward_indicators = [
-        'after', 'following', 'update', 'latest', 'new', 'now',
+    numbers_a = extract_numbers(orig_a)
+    numbers_b = extract_numbers(orig_b)
+    number_intersection = len(numbers_a & numbers_b)
+    number_union = len(numbers_a | numbers_b)
+    features['number_overlap'] = number_intersection / number_union if number_union > 0 else 0
+    
+    bigrams_a = get_bigrams(text_a)
+    bigrams_b = get_bigrams(text_b)
+    bigram_intersection = len(bigrams_a & bigrams_b)
+    bigram_union = len(bigrams_a | bigrams_b)
+    features['bigram_overlap'] = bigram_intersection / bigram_union if bigram_union > 0 else 0
+    
+    update_indicators = [
+        'update', 'latest', 'new', 'now', 'breaking',
         'continues', 'ongoing', 'still', 'again', 'another',
-        'response', 'reaction', 'aftermath'
+        'more', 'further', 'additional'
+    ]
+    features['update_indicator_count'] = sum(1 for ind in update_indicators if ind in text_b)
+    
+    backward_indicators = [
+        'after', 'following', 'since', 'aftermath',
+        'response', 'reaction', 'result', 'consequence'
     ]
     features['backward_ref_count'] = sum(1 for ind in backward_indicators if ind in text_b)
     
-    # Forward reference indicators (A anticipates B)
-    forward_indicators = [
-        'will', 'expected', 'planned', 'upcoming', 'tomorrow',
-        'next', 'future', 'soon'
-    ]
-    features['forward_ref_count'] = sum(1 for ind in forward_indicators if ind in text_a)
-    
-    # Event type indicators
-    breaking_indicators = ['breaking', 'just in', 'alert', 'urgent']
+    breaking_indicators = ['breaking', 'just in', 'alert', 'urgent', 'developing']
     features['is_breaking_a'] = 1 if any(ind in text_a for ind in breaking_indicators) else 0
     features['is_breaking_b'] = 1 if any(ind in text_b for ind in breaking_indicators) else 0
     
-    # TF-IDF cosine similarity (if vectorizer provided)
     if tfidf_vectorizer is not None:
         vec_a = tfidf_vectorizer.transform([text_a]).toarray()[0]
         vec_b = tfidf_vectorizer.transform([text_b]).toarray()[0]
@@ -138,32 +130,40 @@ def extract_threading_features(
         norm_b = np.linalg.norm(vec_b)
         
         features['tfidf_cosine'] = dot / (norm_a * norm_b) if (norm_a * norm_b) > 0 else 0
+        features['tfidf_euclidean'] = np.linalg.norm(vec_a - vec_b)
+    else:
+        features['tfidf_cosine'] = 0
+        features['tfidf_euclidean'] = 0
     
     return features
+
+
+# Feature names for reference
+THREADING_FEATURE_NAMES = [
+    # Lexical overlap
+    'jaccard', 'common_words', 'words_only_in_a', 'words_only_in_b', 'novelty_ratio',
+    # Length
+    'len_a', 'len_b', 'len_diff', 'len_ratio',
+    # Entity & number
+    'entity_overlap', 'number_overlap', 'bigram_overlap',
+    # Linguistic markers
+    'update_indicator_count', 'backward_ref_count', 'is_breaking_a', 'is_breaking_b',
+    # TF-IDF
+    'tfidf_cosine', 'tfidf_euclidean'
+]
 
 
 def extract_features_batch(
     df: pd.DataFrame,
     tfidf_vectorizer: TfidfVectorizer = None
 ) -> pd.DataFrame:
-    """
-    Extract features for a batch of article pairs.
-    
-    Args:
-        df: DataFrame with text_a, text_b, date_a, date_b columns
-        tfidf_vectorizer: Optional pre-fitted vectorizer
-        
-    Returns:
-        DataFrame with feature columns
-    """
-    print(f"Extracting features for {len(df)} pairs...")
+    """Extract features for batch."""
     
     features_list = []
     
     for idx, row in df.iterrows():
-        features = extract_threading_features(
+        features = extract_threading_features_fixed(
             row['text_a'], row['text_b'],
-            row['date_a'], row['date_b'],
             tfidf_vectorizer
         )
         features_list.append(features)
@@ -176,24 +176,11 @@ def extract_features_batch(
     return features_df
 
 
-# =============================================================================
-# EVENT THREADING CLASSIFIER
-# =============================================================================
-
 class EventThreadingClassifier:
-    """
-    Classifier for predicting temporal relationships between articles.
-    
-    Predicts: SAME_DAY, IMMEDIATE_UPDATE, SHORT_TERM_DEV, LONG_TERM_DEV, DISTANT_RELATED
-    """
+    """Event threading classifier."""
     
     def __init__(self, model_type: str = 'xgboost'):
-        """
-        Initialize classifier.
-        
-        Args:
-            model_type: 'xgboost', 'rf' (random forest), or 'gb' (gradient boosting)
-        """
+        """Initialize classifier."""
         self.model_type = model_type
         self.model = None
         self.tfidf_vectorizer = None
@@ -205,20 +192,11 @@ class EventThreadingClassifier:
         train_df: pd.DataFrame,
         val_df: pd.DataFrame = None
     ):
-        """
-        Train the threading classifier.
-        
-        Args:
-            train_df: Training data with text_a, text_b, date_a, date_b, temporal_relation
-            val_df: Optional validation data for early stopping
-        """
-        print("\n" + "="*60)
-        print("TRAINING EVENT THREADING CLASSIFIER")
-        print("="*60)
-        
-        # Fit TF-IDF on training texts
-        print("Fitting TF-IDF vectorizer...")
-        all_texts = pd.concat([train_df['text_a'], train_df['text_b']]).apply(str.lower)
+        """Train classifier."""
+        all_texts = pd.concat([
+            train_df['text_a'].apply(lambda x: str(x).lower() if not pd.isna(x) else ""),
+            train_df['text_b'].apply(lambda x: str(x).lower() if not pd.isna(x) else "")
+        ])
         self.tfidf_vectorizer = TfidfVectorizer(
             max_features=3000,
             ngram_range=(1, 2),
@@ -226,17 +204,13 @@ class EventThreadingClassifier:
         )
         self.tfidf_vectorizer.fit(all_texts)
         
-        # Extract features
         X_train = extract_features_batch(train_df, self.tfidf_vectorizer)
         self.feature_columns = X_train.columns.tolist()
-        
-        # Encode labels
         y_train = self.label_encoder.fit_transform(train_df['temporal_relation'])
         
-        print(f"Training features shape: {X_train.shape}")
+        print(f"Training: {len(X_train)} samples, {X_train.shape[1]} features")
         print(f"Classes: {self.label_encoder.classes_}")
         
-        # Initialize model
         if self.model_type == 'xgboost':
             self.model = xgb.XGBClassifier(
                 objective='multi:softmax',
@@ -247,7 +221,8 @@ class EventThreadingClassifier:
                 subsample=0.8,
                 colsample_bytree=0.8,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                early_stopping_rounds=10 if val_df is not None else None
             )
         elif self.model_type == 'rf':
             self.model = RandomForestClassifier(
@@ -263,9 +238,6 @@ class EventThreadingClassifier:
                 random_state=42
             )
         
-        # Train
-        print(f"Training {self.model_type} model...")
-        
         if val_df is not None and self.model_type == 'xgboost':
             X_val = extract_features_batch(val_df, self.tfidf_vectorizer)
             y_val = self.label_encoder.transform(val_df['temporal_relation'])
@@ -278,25 +250,18 @@ class EventThreadingClassifier:
         else:
             self.model.fit(X_train, y_train)
         
-        print("Training complete!")
-        
-        # Evaluate on training data
-        train_pred = self.model.predict(X_train)
-        train_acc = accuracy_score(y_train, train_pred)
-        print(f"Training accuracy: {train_acc:.4f}")
+        if hasattr(self.model, 'feature_importances_'):
+            importance = self.model.feature_importances_
+            sorted_idx = np.argsort(importance)[::-1]
+            print("Top 5 features:")
+            for rank, idx in enumerate(sorted_idx[:5], 1):
+                name = self.feature_columns[idx]
+                print(f"  {name}: {importance[idx]:.4f}")
     
     def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Predict temporal relations for article pairs.
-        
-        Args:
-            df: DataFrame with text_a, text_b, date_a, date_b
-            
-        Returns:
-            Array of predicted relation labels
-        """
+        """Predict temporal relations."""
         X = extract_features_batch(df, self.tfidf_vectorizer)
-        X = X[self.feature_columns]  # Ensure correct column order
+        X = X[self.feature_columns]
         
         y_pred = self.model.predict(X)
         labels = self.label_encoder.inverse_transform(y_pred)
@@ -304,31 +269,22 @@ class EventThreadingClassifier:
         return labels
     
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Predict probabilities for each temporal relation.
-        """
+        """Predict probabilities."""
         X = extract_features_batch(df, self.tfidf_vectorizer)
         X = X[self.feature_columns]
         
         return self.model.predict_proba(X)
     
     def evaluate(self, test_df: pd.DataFrame) -> Dict[str, float]:
-        """
-        Evaluate classifier on test data.
-        """
-        print("\n" + "="*60)
-        print("THREADING CLASSIFIER EVALUATION")
-        print("="*60)
-        
+        """Evaluate classifier."""
         y_true = test_df['temporal_relation'].values
         y_pred = self.predict(test_df)
         
-        # Metrics
         accuracy = accuracy_score(y_true, y_pred)
         macro_f1 = f1_score(y_true, y_pred, average='macro')
         weighted_f1 = f1_score(y_true, y_pred, average='weighted')
         
-        print(f"\nAccuracy: {accuracy:.4f}")
+        print(f"Accuracy: {accuracy:.4f}")
         print(f"Macro F1: {macro_f1:.4f}")
         print(f"Weighted F1: {weighted_f1:.4f}")
         
@@ -342,21 +298,21 @@ class EventThreadingClassifier:
         }
     
     def save(self, filepath: str):
-        """Save model to file."""
+        """Save model."""
         model_data = {
             'model': self.model,
             'tfidf_vectorizer': self.tfidf_vectorizer,
             'label_encoder': self.label_encoder,
             'feature_columns': self.feature_columns,
-            'model_type': self.model_type
+            'model_type': self.model_type,
+            'version': 'fixed_no_leakage_v1'
         }
         with open(filepath, 'wb') as f:
             pickle.dump(model_data, f)
-        print(f"Model saved to {filepath}")
     
     @classmethod
     def load(cls, filepath: str) -> 'EventThreadingClassifier':
-        """Load model from file."""
+        """Load model."""
         with open(filepath, 'rb') as f:
             model_data = pickle.load(f)
         
@@ -369,22 +325,11 @@ class EventThreadingClassifier:
         return classifier
 
 
-# =============================================================================
-# TIMELINE CONSTRUCTION
-# =============================================================================
-
 class TimelineBuilder:
-    """
-    Builds ordered timelines from clustered articles using threading predictions.
-    """
+    """Timeline builder."""
     
-    def __init__(self, threading_classifier: EventThreadingClassifier):
-        """
-        Initialize timeline builder.
-        
-        Args:
-            threading_classifier: Trained EventThreadingClassifier
-        """
+    def __init__(self, threading_classifier: EventThreadingClassifier = None):
+        """Initialize timeline builder."""
         self.classifier = threading_classifier
     
     def build_timeline(
@@ -392,16 +337,7 @@ class TimelineBuilder:
         articles: pd.DataFrame,
         method: str = 'hybrid'
     ) -> List[Dict]:
-        """
-        Build ordered timeline for a set of related articles.
-        
-        Args:
-            articles: DataFrame with title, date columns (all from same cluster)
-            method: 'date' (simple), 'graph' (threading-based), 'hybrid' (combined)
-            
-        Returns:
-            List of articles in timeline order with metadata
-        """
+        """Build timeline."""
         if len(articles) == 0:
             return []
         
@@ -413,18 +349,24 @@ class TimelineBuilder:
         
         if method == 'date':
             return self._build_by_date(articles)
-        elif method == 'graph':
+        elif method == 'graph' and self.classifier is not None:
             return self._build_by_graph(articles)
-        else:  # hybrid
+        else:
             return self._build_hybrid(articles)
     
     def _article_to_dict(self, article: pd.Series, position: int, role: str = 'event') -> Dict:
         """Convert article to timeline entry."""
+        date_val = article['date']
+        if hasattr(date_val, 'date'):
+            date_str = str(date_val.date())
+        else:
+            date_str = str(date_val)
+        
         return {
             'position': position,
             'title': article['title'],
-            'date': str(article['date'].date()) if hasattr(article['date'], 'date') else str(article['date']),
-            'role': role,  # 'initial', 'update', 'development', 'conclusion'
+            'date': date_str,
+            'role': role,
             'node_index': article.get('node_index', None)
         }
     
@@ -440,14 +382,11 @@ class TimelineBuilder:
         return timeline
     
     def _build_by_graph(self, articles: pd.DataFrame) -> List[Dict]:
-        """
-        Build timeline using threading predictions to create dependency graph.
-        """
+        """Build using threading predictions."""
         if not NETWORKX_AVAILABLE:
-            print("Warning: networkx not available, falling back to date ordering")
             return self._build_by_date(articles)
         
-        # Create pairs for prediction
+        # Create pairs
         pairs = []
         indices = articles.index.tolist()
         
@@ -456,12 +395,9 @@ class TimelineBuilder:
                 if i < j:
                     art_a = articles.loc[idx_a]
                     art_b = articles.loc[idx_b]
-                    
                     pairs.append({
                         'text_a': art_a['title'],
                         'text_b': art_b['title'],
-                        'date_a': str(art_a['date'].date()) if hasattr(art_a['date'], 'date') else str(art_a['date']),
-                        'date_b': str(art_b['date'].date()) if hasattr(art_b['date'], 'date') else str(art_b['date']),
                         'idx_a': idx_a,
                         'idx_b': idx_b
                     })
@@ -470,61 +406,44 @@ class TimelineBuilder:
             return self._build_by_date(articles)
         
         pairs_df = pd.DataFrame(pairs)
-        
-        # Predict relationships
         relations = self.classifier.predict(pairs_df)
         
-        # Build directed graph
+        # Build graph
         G = nx.DiGraph()
         G.add_nodes_from(indices)
         
-        # Add edges based on temporal relationships
         for (_, row), relation in zip(pairs_df.iterrows(), relations):
             idx_a, idx_b = row['idx_a'], row['idx_b']
-            date_a = pd.to_datetime(row['date_a'])
-            date_b = pd.to_datetime(row['date_b'])
+            date_a = articles.loc[idx_a, 'date']
+            date_b = articles.loc[idx_b, 'date']
             
-            # Determine direction based on dates and relationship
             if date_a <= date_b:
                 earlier, later = idx_a, idx_b
             else:
                 earlier, later = idx_b, idx_a
             
-            # Add edge from earlier to later (dependency)
             if relation in ['IMMEDIATE_UPDATE', 'SHORT_TERM_DEV']:
                 G.add_edge(earlier, later, relation=relation, weight=2)
             elif relation == 'SAME_DAY':
                 G.add_edge(earlier, later, relation=relation, weight=1)
         
-        # Topological sort (or approximate if cycles exist)
         try:
             order = list(nx.topological_sort(G))
         except nx.NetworkXUnfeasible:
-            # Graph has cycles, fall back to date-based with graph hints
             order = sorted(indices, key=lambda x: articles.loc[x, 'date'])
         
-        # Build timeline
         timeline = []
         for i, idx in enumerate(order):
             article = articles.loc[idx]
-            
-            # Determine role
-            if i == 0:
-                role = 'initial'
-            elif G.in_degree(idx) > 1:
+            role = 'initial' if i == 0 else 'update'
+            if G.in_degree(idx) > 1:
                 role = 'development'
-            else:
-                role = 'update'
-            
             timeline.append(self._article_to_dict(article, i, role))
         
         return timeline
     
     def _build_hybrid(self, articles: pd.DataFrame) -> List[Dict]:
-        """
-        Hybrid approach: use dates as primary, threading to resolve ties.
-        """
-        # Group by date
+        """Use dates as primary, content analysis for same-day ordering."""
         articles = articles.copy()
         articles['date_only'] = articles['date'].dt.date
         
@@ -533,13 +452,11 @@ class TimelineBuilder:
         
         for date, group in articles.groupby('date_only', sort=True):
             if len(group) == 1:
-                # Single article on this date
                 article = group.iloc[0]
                 role = 'initial' if position == 0 else 'update'
                 timeline.append(self._article_to_dict(article, position, role))
                 position += 1
             else:
-                # Multiple articles on same date - use threading to order
                 sub_timeline = self._order_same_day(group, position)
                 timeline.extend(sub_timeline)
                 position += len(sub_timeline)
@@ -547,22 +464,15 @@ class TimelineBuilder:
         return timeline
     
     def _order_same_day(self, articles: pd.DataFrame, start_position: int) -> List[Dict]:
-        """Order articles from the same day using content analysis."""
-        # Simple heuristic: breaking news first, then by title length (shorter = headline)
+        """Order articles from the same day."""
         articles = articles.copy()
         
-        # Score articles
         def score_article(title):
-            title_lower = title.lower()
+            title_lower = str(title).lower()
             score = 0
-            
-            # Breaking news indicators
             if any(ind in title_lower for ind in ['breaking', 'just in', 'alert']):
                 score += 10
-            
-            # Shorter titles often more significant
-            score -= len(title.split()) * 0.1
-            
+            score -= len(title_lower.split()) * 0.1
             return score
         
         articles['_score'] = articles['title'].apply(score_article)
@@ -576,32 +486,19 @@ class TimelineBuilder:
         return timeline
 
 
-# =============================================================================
-# EVALUATION METRICS FOR ORDERING
-# =============================================================================
-
 def kendall_tau(predicted_order: List, true_order: List) -> float:
-    """
-    Compute Kendall's Tau correlation between predicted and true orderings.
-    
-    Returns value in [-1, 1] where:
-    - 1 = perfect agreement
-    - 0 = random ordering
-    - -1 = perfect disagreement (reversed)
-    """
+    """Compute Kendall's Tau correlation."""
     from scipy.stats import kendalltau
     
     if len(predicted_order) != len(true_order):
         raise ValueError("Orders must have same length")
     
     if len(predicted_order) < 2:
-        return 1.0  # Perfect for single item
+        return 1.0
     
-    # Convert to ranks
     pred_ranks = {item: i for i, item in enumerate(predicted_order)}
     true_ranks = {item: i for i, item in enumerate(true_order)}
     
-    # Create rank arrays
     items = list(pred_ranks.keys())
     pred_array = [pred_ranks[item] for item in items]
     true_array = [true_ranks[item] for item in items]
@@ -611,103 +508,33 @@ def kendall_tau(predicted_order: List, true_order: List) -> float:
     return tau
 
 
-def evaluate_timeline_ordering(
-    predicted_timelines: Dict[str, List],
-    true_timelines: Dict[str, List]
-) -> Dict[str, float]:
-    """
-    Evaluate timeline ordering quality.
-    
-    Args:
-        predicted_timelines: {cluster_id: [ordered article ids]}
-        true_timelines: {topic_id: [ordered article ids]}
-        
-    Returns:
-        Evaluation metrics
-    """
-    tau_scores = []
-    
-    for cluster_id, pred_order in predicted_timelines.items():
-        if cluster_id in true_timelines:
-            true_order = true_timelines[cluster_id]
-            
-            # Get common items
-            common = set(pred_order) & set(true_order)
-            
-            if len(common) >= 2:
-                pred_filtered = [x for x in pred_order if x in common]
-                true_filtered = [x for x in true_order if x in common]
-                
-                tau = kendall_tau(pred_filtered, true_filtered)
-                tau_scores.append(tau)
-    
-    if len(tau_scores) == 0:
-        return {'kendall_tau_mean': 0, 'kendall_tau_std': 0, 'n_evaluated': 0}
-    
-    return {
-        'kendall_tau_mean': np.mean(tau_scores),
-        'kendall_tau_std': np.std(tau_scores),
-        'n_evaluated': len(tau_scores)
-    }
-
-
-# =============================================================================
-# MAIN TRAINING PIPELINE
-# =============================================================================
-
 def train_stage3(
     data_dir: str = './prepared_data',
     model_output: str = './models/stage3_threading.pkl'
 ) -> Tuple[EventThreadingClassifier, Dict[str, float]]:
-    """
-    Train Stage 3 event threading classifier.
-    
-    Args:
-        data_dir: Directory with prepared data
-        model_output: Where to save trained model
-        
-    Returns:
-        (classifier, metrics)
-    """
-    print("="*60)
-    print("STAGE 3: EVENT THREADING CLASSIFIER")
-    print("="*60)
-    
+    """Train Stage 3 event threading classifier."""
     data_path = Path(data_dir)
     
-    # Load threading data
-    print("\nLoading threading data...")
+    print("Loading data...")
     train_df = pd.read_csv(data_path / 'threading_train.csv')
     val_df = pd.read_csv(data_path / 'threading_val.csv')
     test_df = pd.read_csv(data_path / 'threading_test.csv')
     
-    print(f"Train: {len(train_df)} pairs")
-    print(f"Val:   {len(val_df)} pairs")
-    print(f"Test:  {len(test_df)} pairs")
+    print(f"Train: {len(train_df)} pairs, Val: {len(val_df)} pairs, Test: {len(test_df)} pairs")
     
-    # Initialize and train classifier
     classifier = EventThreadingClassifier(model_type='xgboost')
+    print("Training classifier...")
     classifier.fit(train_df, val_df)
-    
-    # Evaluate
+    print("Evaluating classifier...")
     metrics = classifier.evaluate(test_df)
     
-    # Save model
+    print("Saving model...")
     model_path = Path(model_output)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     classifier.save(model_output)
     
-    print("\n" + "="*60)
-    print("STAGE 3 COMPLETE!")
-    print("="*60)
-    print(f"Model saved to: {model_output}")
-    
     return classifier, metrics
 
-
-# =============================================================================
-# RUN
-# =============================================================================
 
 if __name__ == "__main__":
     classifier, metrics = train_stage3(
